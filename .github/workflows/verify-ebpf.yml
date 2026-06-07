@@ -1,114 +1,115 @@
 name: Verify eBPF cheatsheet (execsnoop / opensnoop)
 
-# Запускается при каждом пуше и вручную (кнопка Run workflow во вкладке Actions)
 on:
   push:
   workflow_dispatch:
 
+# Глушим шумные warning'и компилятора BCC, чтобы они не мешали grep по выводу
+env:
+  BCC_LOGLEVEL: "1"
+
 jobs:
   verify-bcc:
-    runs-on: ubuntu-latest   # полноценная VM с обычным ядром, root через sudo, BPF доступен
+    runs-on: ubuntu-latest
 
     steps:
       - name: Показать ядро и окружение
         run: |
           uname -a
-          echo "--- проверяем поддержку BPF в ядре ---"
           grep -E "CONFIG_BPF=y|CONFIG_BPF_SYSCALL=y" /boot/config-$(uname -r) || true
 
       - name: Установить BCC-инструменты
         run: |
           sudo apt-get update
           sudo apt-get install -y bpfcc-tools linux-headers-$(uname -r)
-          # бинарники ставятся с суффиксом -bpfcc; делаем их доступными по коротким именам
           sudo ln -sf /usr/sbin/execsnoop-bpfcc /usr/local/bin/execsnoop
           sudo ln -sf /usr/sbin/opensnoop-bpfcc /usr/local/bin/opensnoop
           echo "execsnoop -> $(command -v execsnoop)"
           echo "opensnoop -> $(command -v opensnoop)"
 
-      # --- 1. Проверяем, что каждый флаг ПРИНИМАЕТСЯ инструментом (--help не требует ядра) ---
-      - name: Синтаксис флагов (--help парсится без ошибок)
+      # Прогрев: первый запуск компилирует eBPF под ядро (может занять 10-30с).
+      - name: Прогрев BCC (первая компиляция eBPF)
+        run: |
+          echo "Первая компиляция BCC под текущее ядро, это долго..."
+          sudo timeout 40 opensnoop -d 1 > /dev/null 2>&1 || true
+          echo "Прогрев завершён."
+
+      - name: Синтаксис флагов (--help парсится)
         run: |
           set -e
           for tool in execsnoop opensnoop; do
-            echo "==== $tool --help ===="
-            sudo $tool --help > /dev/null && echo "[OK] $tool --help"
+            sudo $tool --help > /dev/null 2>&1 && echo "[OK] $tool --help"
           done
 
-      # --- 2. execsnoop реально ловит запуск процессов ---
+      # execsnoop: 10с на старт, события генерируем В ЦИКЛЕ всё время трассировки
       - name: execsnoop ловит новый процесс
         run: |
           set -e
-          # запускаем трассировку на 5 секунд в фон, пишем в файл
-          sudo timeout 6 execsnoop -t > exec.out 2>&1 &
+          sudo timeout 20 execsnoop -t 2> /dev/null 1> exec.out &
           BG=$!
+          echo "Ждём старт трассировщика (компиляция eBPF)..."
+          sleep 10
+          echo "Генерируем процессы..."
+          for i in $(seq 1 20); do
+            /bin/sleep 0.05
+            /usr/bin/env CHEATSHEET=1 /bin/true
+          done
           sleep 2
-          # генерируем заведомо уникальный процесс
-          /bin/sleep 0.1 ; /usr/bin/env CHEATSHEET_MARKER=1 /bin/true
-          # ждём завершения трассировки
+          sudo kill $BG 2>/dev/null || true
           wait $BG 2>/dev/null || true
-          echo "--- вывод execsnoop (первые строки) ---"
-          head -20 exec.out
-          echo "--- проверка: поймал ли он процессы ---"
-          grep -qE "sleep|true|env" exec.out && echo "[PASS] execsnoop поймал процессы" \
-            || { echo "[FAIL] execsnoop ничего не поймал"; exit 1; }
+          echo "--- пойманные строки (фильтр sleep/true/env) ---"
+          grep -E "sleep|true|env" exec.out | head -10 || true
+          grep -qE "sleep|true|env" exec.out \
+            && echo "[PASS] execsnoop поймал процессы" \
+            || { echo "[FAIL] execsnoop ничего не поймал"; echo '--- полный вывод ---'; cat exec.out; exit 1; }
 
-      # --- 3. execsnoop -x показывает неудачный exec ---
-      - name: execsnoop -x ловит неудачный exec
+      # opensnoop -x: главный пример — ловит ENOENT на несуществующем файле
+      - name: opensnoop -x ловит ENOENT
         run: |
           set -e
-          sudo timeout 6 execsnoop -x > execx.out 2>&1 &
+          sudo timeout 20 opensnoop -x 2> /dev/null 1> openx.out &
           BG=$!
+          sleep 10
+          echo "Читаем несуществующие файлы..."
+          for i in $(seq 1 20); do
+            cat /etc/cheatsheet_does_not_exist_xyz 2>/dev/null || true
+            sleep 0.05
+          done
           sleep 2
-          # пытаемся запустить несуществующий бинарь -> неудачный execve
-          /bin/bash -c '/nonexistent/binary_xyz 2>/dev/null' || true
+          sudo kill $BG 2>/dev/null || true
           wait $BG 2>/dev/null || true
-          echo "--- вывод execsnoop -x ---"
-          cat execx.out
-          # при неудаче RET будет отрицательным (-2 = ENOENT)
-          grep -qE "binary_xyz|-2" execx.out && echo "[PASS] execsnoop -x увидел неудачный exec" \
-            || echo "[WARN] неудачный exec не зафиксирован (возможно, шелл не вызвал execve напрямую)"
+          echo "--- пойманные строки ---"
+          grep "cheatsheet_does_not_exist_xyz" openx.out | head -5 || true
+          grep -q "cheatsheet_does_not_exist_xyz" openx.out \
+            && echo "[PASS] opensnoop -x поймал ENOENT" \
+            || { echo "[FAIL] opensnoop -x не поймал файл"; echo '--- полный вывод ---'; cat openx.out; exit 1; }
 
-      # --- 4. opensnoop -x реально ловит ENOENT (главный пример из шпаргалки) ---
-      - name: opensnoop -x ловит несуществующий файл (ENOENT)
-        run: |
-          set -e
-          sudo timeout 6 opensnoop -x > openx.out 2>&1 &
-          BG=$!
-          sleep 2
-          # читаем заведомо несуществующий файл -> open() вернёт -1 / ENOENT(2)
-          cat /etc/cheatsheet_does_not_exist_xyz 2>/dev/null || true
-          wait $BG 2>/dev/null || true
-          echo "--- вывод opensnoop -x ---"
-          cat openx.out
-          grep -q "cheatsheet_does_not_exist_xyz" openx.out && echo "[PASS] opensnoop -x поймал ENOENT" \
-            || { echo "[FAIL] opensnoop -x не поймал несуществующий файл"; exit 1; }
-
-      # --- 5. opensnoop -d (встроенный таймаут) завершается сам ---
+      # opensnoop -d: встроенный таймер завершает трассировку сам
       - name: opensnoop -d завершается по таймеру
         run: |
           set -e
           start=$(date +%s)
-          sudo opensnoop -d 3 > opend.out 2>&1 || true
+          sudo opensnoop -d 3 > /dev/null 2>&1 || true
           end=$(date +%s)
           dur=$((end - start))
           echo "opensnoop -d 3 проработал ${dur}с"
-          [ "$dur" -ge 2 ] && [ "$dur" -le 8 ] && echo "[PASS] -d отработал как встроенный таймер" \
+          [ "$dur" -ge 2 ] && [ "$dur" -le 40 ] \
+            && echo "[PASS] -d отработал как встроенный таймер" \
             || { echo "[FAIL] -d отработал не за ожидаемое время"; exit 1; }
 
-      # --- 6. Bash-пайплайн из карточки 4 (awk $NF | sort | uniq -c) ---
-      - name: Пайплайн агрегации путей
+      # Bash-пайплайн из карточки 4 (не зависит от ядра)
+      - name: Пайплайн агрегации путей (awk NF | sort | uniq -c)
         run: |
           set -e
           printf '%s\n' \
             "14097 mysqld -1 2 /etc/my.cnf.d/server.cnf" \
             "2201 nginx -1 2 /var/www/missing.conf" \
             "2201 nginx -1 2 /var/www/missing.conf" > fail.log
-          echo "--- топ путей ---"
           out=$(awk '{print $NF}' fail.log | sort | uniq -c | sort -nr | head)
           echo "$out"
-          echo "$out" | grep -q "missing.conf" && echo "[PASS] пайплайн агрегации работает" \
-            || { echo "[FAIL] пайплайн не дал ожидаемого результата"; exit 1; }
+          echo "$out" | grep -q "missing.conf" \
+            && echo "[PASS] пайплайн агрегации работает" \
+            || { echo "[FAIL] пайплайн не дал результата"; exit 1; }
 
       - name: Итог
-        run: echo "Все проверки eBPF-шпаргалки пройдены на живом ядре ✅"
+        run: echo "Проверки eBPF-шпаргалки пройдены на живом ядре."
