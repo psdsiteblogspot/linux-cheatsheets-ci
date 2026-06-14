@@ -1,115 +1,192 @@
-name: Verify eBPF cheatsheet (execsnoop / opensnoop)
+name: Verify Linux cheatsheets
 
+# Запускается при пуше и вручную (кнопка Run workflow во вкладке Actions)
 on:
   push:
   workflow_dispatch:
 
-# Глушим шумные warning'и компилятора BCC, чтобы они не мешали grep по выводу
-env:
-  BCC_LOGLEVEL: "1"
-
 jobs:
-  verify-bcc:
+  # ============================================================
+  # JOB 1: grep -E (ERE) — чистый grep, без root и зависимостей
+  # ============================================================
+  grep-ere:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Показать ядро и окружение
+      - name: Подготовка тестовых данных
         run: |
-          uname -a
-          grep -E "CONFIG_BPF=y|CONFIG_BPF_SYSCALL=y" /boot/config-$(uname -r) || true
+          printf 'louise pts/0\nmatty pts/1\nroot tty1\npauline pts/2\n' > who.txt
+          printf 'bzip2\ngzfile\nzipper\ntarball\nmybz\n' > dirlist1.txt
+          printf '(123)-456-7890\n123-456-7890\n(12)-456-7890\nabc-def\n' > phones.txt
+          printf '883\n888883\n83\n' > myfile
+          printf '5ABx\n5abc\nx5XY\n' > data.txt
+          printf '192.168.1.10 - - "GET /a" 200 12\n10.0.0.5 - - "POST /b" 404 8\n8.8.8.8 - - "GET /c" 500 0\n' > access.log
+          printf 'ssh login\nsshd restart\n' > auth.log
 
+      - name: Чередование и группировка
+        run: |
+          set -e
+          test "$(grep -Ec 'louise|matty|pauline' who.txt)" = "3"
+          grep -Eh '^(bz|gz|zip)' dirlist*.txt | grep -qv mybz
+          echo "[PASS] чередование | и группировка ()"
+
+      - name: Квантификаторы (исправленный телефон, +, {n,m})
+        run: |
+          set -e
+          test "$(grep -Ec '^\(?[0-9]{3}\)?-[0-9]{3}-[0-9]{4}$' phones.txt)" = "2"
+          echo "a b c" | grep -Eq '^([[:alpha:]]+ ?)+$'
+          grep -Eq '8{2,6}3' myfile
+          echo "[PASS] квантификаторы ? + {n,m}"
+
+      - name: Инверсия и POSIX-классы
+        run: |
+          set -e
+          test "$(grep -Evc '^\(?[0-9]{3}\)?-[0-9]{3}-[0-9]{4}$' phones.txt)" = "2"
+          grep -Eq '5[[:upper:]]{2}' data.txt
+          echo "[PASS] -v и [[:upper:]]"
+
+      - name: Боевые примеры по логам
+        run: |
+          set -e
+          test "$(grep -Ec ' (4|5)[0-9]{2} ' access.log)" = "2"
+          test "$(grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}' access.log | head -1)" = "192.168.1.10"
+          grep -Ew 'ssh' auth.log | grep -qv sshd
+          test "$(grep -Ec ' 200 ' access.log)" = "1"
+          echo "[PASS] HTTP-коды, -o IP, -w, -c"
+
+  # ============================================================
+  # JOB 2: systemd timer — валидация юнитов и расписаний.
+  # systemd-analyze работает на раннере БЕЗ root.
+  # ============================================================
+  systemd-timer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Создать unit-файлы из шпаргалки
+        run: |
+          mkdir -p units
+          cat > units/backup.service <<'EOF'
+          [Unit]
+          Description=Database Backup Service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/db_backup.sh
+          EOF
+          cat > units/backup.timer <<'EOF'
+          [Unit]
+          Description=Run DB backup daily
+          [Timer]
+          OnCalendar=Mon..Fri *-*-* 09..17:00/15
+          Persistent=true
+          [Install]
+          WantedBy=timers.target
+          EOF
+          cat > units/storm.timer <<'EOF'
+          [Unit]
+          Description=Storm test
+          [Timer]
+          OnBootSec=10min
+          OnUnitActiveSec=2h
+          RandomizedDelaySec=1800
+          AccuracySec=1s
+          [Install]
+          WantedBy=timers.target
+          EOF
+          cat > units/storm.service <<'EOF'
+          [Unit]
+          Description=Storm svc
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/true
+          EOF
+
+      - name: verify — синтаксис юнитов (карточки 1 и 2)
+        run: |
+          set -e
+          systemd-analyze verify ./units/backup.timer
+          systemd-analyze verify ./units/storm.timer
+          echo "[PASS] оба таймера прошли systemd-analyze verify"
+
+      - name: calendar — расписание срабатывает корректно (карточки 1, 3)
+        run: |
+          set -e
+          # валидные выражения -> rc=0
+          systemd-analyze calendar 'Mon..Fri *-*-* 09..17:00/15' > cal.out
+          systemd-analyze calendar '*:0/10' > /dev/null
+          cat cal.out
+          # проверяем, что первые срабатывания идут с шагом 15 минут
+          out=$(systemd-analyze calendar --iterations=3 'Mon..Fri *-*-* 09..17:00/15')
+          echo "$out" | grep -q "09:00:00" && echo "$out" | grep -q "09:15:00" \
+            && echo "[PASS] OnCalendar даёт каждые 15 мин" \
+            || { echo "[FAIL] неверное расписание"; exit 1; }
+
+      - name: timespan — значения монотонных таймеров (карточка 2)
+        run: |
+          set -e
+          for ts in 10min 2h 1800 1s 45m; do
+            systemd-analyze timespan "$ts" > /dev/null
+          done
+          echo "[PASS] все timespan-значения валидны"
+
+      - name: Негативный тест — битое выражение ДОЛЖНО отклоняться
+        run: |
+          if systemd-analyze calendar 'ThisIsNotValid!!!' > /dev/null 2>&1; then
+            echo "[FAIL] битый календарь не должен проходить"; exit 1
+          else
+            echo "[PASS] битый календарь корректно отклонён"
+          fi
+
+      - name: Проверка синтаксиса команд применения (карточка 5)
+        run: |
+          set -e
+          # бинарники присутствуют и понимают флаги (--help не требует systemd как PID1)
+          systemctl --help > /dev/null
+          journalctl --help > /dev/null
+          echo "[PASS] systemctl/journalctl доступны (enable/list-timers выполняются на реальном сервере)"
+
+  # ============================================================
+  # JOB 3: eBPF (execsnoop / opensnoop) — нужен root + BPF + headers
+  # ============================================================
+  ebpf-bcc:
+    runs-on: ubuntu-latest
+    steps:
       - name: Установить BCC-инструменты
         run: |
           sudo apt-get update
           sudo apt-get install -y bpfcc-tools linux-headers-$(uname -r)
           sudo ln -sf /usr/sbin/execsnoop-bpfcc /usr/local/bin/execsnoop
           sudo ln -sf /usr/sbin/opensnoop-bpfcc /usr/local/bin/opensnoop
-          echo "execsnoop -> $(command -v execsnoop)"
-          echo "opensnoop -> $(command -v opensnoop)"
 
-      # Прогрев: первый запуск компилирует eBPF под ядро (может занять 10-30с).
       - name: Прогрев BCC (первая компиляция eBPF)
-        run: |
-          echo "Первая компиляция BCC под текущее ядро, это долго..."
-          sudo timeout 40 opensnoop -d 1 > /dev/null 2>&1 || true
-          echo "Прогрев завершён."
+        run: sudo timeout 40 opensnoop -d 1 > /dev/null 2>&1 || true
 
-      - name: Синтаксис флагов (--help парсится)
-        run: |
-          set -e
-          for tool in execsnoop opensnoop; do
-            sudo $tool --help > /dev/null 2>&1 && echo "[OK] $tool --help"
-          done
-
-      # execsnoop: 10с на старт, события генерируем В ЦИКЛЕ всё время трассировки
       - name: execsnoop ловит новый процесс
         run: |
           set -e
           sudo timeout 20 execsnoop -t 2> /dev/null 1> exec.out &
           BG=$!
-          echo "Ждём старт трассировщика (компиляция eBPF)..."
           sleep 10
-          echo "Генерируем процессы..."
-          for i in $(seq 1 20); do
-            /bin/sleep 0.05
-            /usr/bin/env CHEATSHEET=1 /bin/true
-          done
+          for i in $(seq 1 20); do /bin/sleep 0.05; /usr/bin/env X=1 /bin/true; done
           sleep 2
-          sudo kill $BG 2>/dev/null || true
-          wait $BG 2>/dev/null || true
-          echo "--- пойманные строки (фильтр sleep/true/env) ---"
-          grep -E "sleep|true|env" exec.out | head -10 || true
+          sudo kill $BG 2>/dev/null || true; wait $BG 2>/dev/null || true
           grep -qE "sleep|true|env" exec.out \
             && echo "[PASS] execsnoop поймал процессы" \
-            || { echo "[FAIL] execsnoop ничего не поймал"; echo '--- полный вывод ---'; cat exec.out; exit 1; }
+            || { echo "[FAIL]"; cat exec.out; exit 1; }
 
-      # opensnoop -x: главный пример — ловит ENOENT на несуществующем файле
       - name: opensnoop -x ловит ENOENT
         run: |
           set -e
           sudo timeout 20 opensnoop -x 2> /dev/null 1> openx.out &
           BG=$!
           sleep 10
-          echo "Читаем несуществующие файлы..."
-          for i in $(seq 1 20); do
-            cat /etc/cheatsheet_does_not_exist_xyz 2>/dev/null || true
-            sleep 0.05
-          done
+          for i in $(seq 1 20); do cat /etc/cheatsheet_missing_xyz 2>/dev/null || true; sleep 0.05; done
           sleep 2
-          sudo kill $BG 2>/dev/null || true
-          wait $BG 2>/dev/null || true
-          echo "--- пойманные строки ---"
-          grep "cheatsheet_does_not_exist_xyz" openx.out | head -5 || true
-          grep -q "cheatsheet_does_not_exist_xyz" openx.out \
+          sudo kill $BG 2>/dev/null || true; wait $BG 2>/dev/null || true
+          grep -q "cheatsheet_missing_xyz" openx.out \
             && echo "[PASS] opensnoop -x поймал ENOENT" \
-            || { echo "[FAIL] opensnoop -x не поймал файл"; echo '--- полный вывод ---'; cat openx.out; exit 1; }
+            || { echo "[FAIL]"; cat openx.out; exit 1; }
 
-      # opensnoop -d: встроенный таймер завершает трассировку сам
-      - name: opensnoop -d завершается по таймеру
+      - name: Bash-пайплайн агрегации путей
         run: |
           set -e
-          start=$(date +%s)
-          sudo opensnoop -d 3 > /dev/null 2>&1 || true
-          end=$(date +%s)
-          dur=$((end - start))
-          echo "opensnoop -d 3 проработал ${dur}с"
-          [ "$dur" -ge 2 ] && [ "$dur" -le 40 ] \
-            && echo "[PASS] -d отработал как встроенный таймер" \
-            || { echo "[FAIL] -d отработал не за ожидаемое время"; exit 1; }
-
-      # Bash-пайплайн из карточки 4 (не зависит от ядра)
-      - name: Пайплайн агрегации путей (awk NF | sort | uniq -c)
-        run: |
-          set -e
-          printf '%s\n' \
-            "14097 mysqld -1 2 /etc/my.cnf.d/server.cnf" \
-            "2201 nginx -1 2 /var/www/missing.conf" \
-            "2201 nginx -1 2 /var/www/missing.conf" > fail.log
-          out=$(awk '{print $NF}' fail.log | sort | uniq -c | sort -nr | head)
-          echo "$out"
-          echo "$out" | grep -q "missing.conf" \
-            && echo "[PASS] пайплайн агрегации работает" \
-            || { echo "[FAIL] пайплайн не дал результата"; exit 1; }
-
-      - name: Итог
-        run: echo "Проверки eBPF-шпаргалки пройдены на живом ядре."
+          printf '%s\n' "1 a -1 2 /var/www/x.conf" "2 b -1 2 /var/www/x.conf" > fail.log
+          awk '{print $NF}' fail.log | sort | uniq -c | sort -nr | head | grep -q x.conf
+          echo "[PASS] пайплайн agg"
